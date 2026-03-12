@@ -1826,6 +1826,9 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         .graph-tooltip {{ position: absolute; background: #333; color: white; padding: 8px 12px;
                           border-radius: 4px; font-size: 12px; pointer-events: none; z-index: 1000;
                           max-width: 350px; line-height: 1.4; }}
+        #corpus-view {{ background: white; border: 2px solid #2196F3; border-top: none;
+                        border-radius: 0 0 8px 8px; padding: 20px; min-height: 400px; }}
+        #corpus-svg {{ width: 100%; overflow: visible; }}
     </style>
     <script>
         function toggleNode(id) {{
@@ -1854,6 +1857,10 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
                 window._graphInitialized = true;
                 initGraph();
             }}
+            if (tabName === 'corpus-view' && typeof initCorpusView === 'function' && !window._corpusInitialized) {{
+                window._corpusInitialized = true;
+                initCorpusView();
+            }}
         }}
     </script>
 </head>
@@ -1862,6 +1869,7 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
     <div class="tab-bar">
         <button class="tab-btn active" data-tab="tree-view" onclick="switchTab('tree-view')">Tree View</button>
         <button class="tab-btn" data-tab="graph-view" onclick="switchTab('graph-view')">Graph View</button>
+        <button class="tab-btn" data-tab="corpus-view" onclick="switchTab('corpus-view')">Corpus View</button>
     </div>
     <div id="tree-view" class="tab-panel active">
     <div class="tree">
@@ -2679,6 +2687,306 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
     }}
     </script>
     </div>
+"""
+
+    # Build corpus view data
+    corpus_words = phrase.lower().split()
+    corpus_arcs = []
+    corpus_subs = []
+
+    # Assign colors to parse groups
+    arc_colors = ['#2196F3', '#4CAF50', '#FF9800', '#9C27B0', '#F44336', '#00BCD4', '#795548', '#607D8B']
+
+    def collect_arcs(span_text, depth, color_idx):
+        """Recursively collect arcs from winning parse tree."""
+        words_in_span = span_text.split()
+        if len(words_in_span) < 2:
+            return color_idx
+
+        # Find start position in the input phrase
+        span_start = None
+        for i in range(len(corpus_words) - len(words_in_span) + 1):
+            if corpus_words[i:i+len(words_in_span)] == words_in_span:
+                span_start = i
+                break
+        if span_start is None:
+            return color_idx
+
+        subs, left_ctx, right_ctx, energy, split, origins = get_best_parse(subparse_cache, span_text)
+        color = arc_colors[color_idx % len(arc_colors)]
+
+        corpus_arcs.append({
+            'start': span_start,
+            'end': span_start + len(words_in_span) - 1,
+            'energy': round(energy, 2) if energy != float('inf') else None,
+            'label': span_text,
+            'depth': depth,
+            'color': color,
+        })
+
+        # Get top substitutes — prefer full-length, then sample other lengths
+        if subs:
+            from collections import defaultdict as _defaultdict
+            by_len = _defaultdict(list)
+            for s_text, s_score in subs:
+                by_len[len(s_text.split())].append((s_text, s_score))
+
+            picked = []
+            # Full-length first
+            full_len = len(words_in_span)
+            if full_len in by_len:
+                picked.extend(sorted(by_len[full_len], key=lambda x: -x[1])[:3])
+            # Then other lengths
+            for wlen in sorted(by_len.keys()):
+                if wlen != full_len and len(picked) < 5:
+                    picked.extend(sorted(by_len[wlen], key=lambda x: -x[1])[:2])
+
+            for s_text, s_score in picked[:5]:
+                # Try to find corpus context for this substitute
+                left_context_words = []
+                right_context_words = []
+                if corpus_index and s_text in corpus_index.ngram_index:
+                    positions = corpus_index.ngram_index[s_text]
+                    if positions:
+                        pos = positions[0]  # Take first occurrence
+                        s_len = len(s_text.split())
+                        # Extract context window (3 words each side)
+                        lstart = max(0, pos - 3)
+                        left_context_words = [t for t in corpus_index.tokens[lstart:pos]
+                                              if not t.startswith('__')]
+                        rend = min(len(corpus_index.tokens), pos + s_len + 3)
+                        right_context_words = [t for t in corpus_index.tokens[pos + s_len:rend]
+                                               if not t.startswith('__')]
+                elif s_text in (catalog.units if hasattr(catalog, 'units') else {}):
+                    pattern = catalog.get_unit(s_text)
+                    if pattern:
+                        left_context_words = [w for w, c in pattern.left_words.most_common(3)]
+                        right_context_words = [w for w, c in pattern.right_words.most_common(3)]
+
+                corpus_subs.append({
+                    'span': span_text,
+                    'span_start': span_start,
+                    'span_end': span_start + len(words_in_span) - 1,
+                    'text': s_text,
+                    'words': s_text.split(),
+                    'score': round(s_score, 3),
+                    'left_ctx': left_context_words[:3],
+                    'right_ctx': right_context_words[:3],
+                    'color': color,
+                })
+
+        next_color = color_idx + 1
+
+        # Recurse into children
+        if split and isinstance(split, tuple) and len(split) == 2:
+            if split[0] not in ['aggregation', 'expansion']:
+                left_text, right_text = split
+                if ' ' in left_text:
+                    next_color = collect_arcs(left_text, depth + 1, next_color)
+                if ' ' in right_text:
+                    next_color = collect_arcs(right_text, depth + 1, next_color)
+
+        return next_color
+
+    collect_arcs(phrase.lower(), 0, 0)
+
+    corpus_view_data = _json.dumps({
+        'words': corpus_words,
+        'arcs': corpus_arcs,
+        'substitutes': corpus_subs,
+    })
+
+    html += f"""
+    <div id="corpus-view" class="tab-panel">
+        <svg id="corpus-svg"></svg>
+    </div>
+    <script>
+    const corpusData = {corpus_view_data};
+
+    function initCorpusView() {{
+        const svg = d3.select('#corpus-svg');
+        const container = svg.node().parentNode;
+        const totalWidth = container.getBoundingClientRect().width - 40 || 1000;
+
+        const wordBoxW = 90;
+        const wordBoxH = 32;
+        const wordGap = 6;
+        const phraseWidth = corpusData.words.length * (wordBoxW + wordGap) - wordGap;
+        const phraseX = (totalWidth - phraseWidth) / 2;
+
+        // Calculate heights
+        const maxArcDepth = corpusData.arcs.length > 0 ? d3.max(corpusData.arcs, d => d.depth) : 0;
+        const arcAreaH = (maxArcDepth + 1) * 40 + 30;
+        const phraseY = arcAreaH + 10;
+        const subStartY = phraseY + wordBoxH + 30;
+        const subRowH = 36;
+        const totalSubs = corpusData.substitutes.length;
+        const totalH = subStartY + totalSubs * subRowH + 40;
+
+        svg.attr('viewBox', '0 0 ' + totalWidth + ' ' + totalH)
+           .attr('height', totalH);
+
+        // Draw arcs above the phrase
+        const arcGroup = svg.append('g');
+        corpusData.arcs.forEach((arc, i) => {{
+            const x1 = phraseX + arc.start * (wordBoxW + wordGap) + wordBoxW / 2;
+            const x2 = phraseX + arc.end * (wordBoxW + wordGap) + wordBoxW / 2;
+            const arcH = arcAreaH - arc.depth * 40 - 10;
+            const midX = (x1 + x2) / 2;
+
+            // Draw arc path
+            arcGroup.append('path')
+                .attr('d', 'M ' + x1 + ' ' + phraseY + ' L ' + x1 + ' ' + arcH +
+                           ' L ' + x2 + ' ' + arcH + ' L ' + x2 + ' ' + phraseY)
+                .attr('fill', 'none')
+                .attr('stroke', arc.color)
+                .attr('stroke-width', 2)
+                .attr('opacity', 0.8);
+
+            // Energy label on the arc
+            if (arc.energy !== null) {{
+                arcGroup.append('text')
+                    .attr('x', midX)
+                    .attr('y', arcH - 4)
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '11px')
+                    .attr('fill', arc.color)
+                    .attr('font-weight', 'bold')
+                    .text('E=' + arc.energy);
+            }}
+        }});
+
+        // Draw input phrase word boxes
+        const phraseGroup = svg.append('g');
+        corpusData.words.forEach((word, i) => {{
+            const x = phraseX + i * (wordBoxW + wordGap);
+
+            phraseGroup.append('rect')
+                .attr('x', x).attr('y', phraseY)
+                .attr('width', wordBoxW).attr('height', wordBoxH)
+                .attr('rx', 4)
+                .attr('fill', '#E3F2FD')
+                .attr('stroke', '#1565C0')
+                .attr('stroke-width', 1.5);
+
+            phraseGroup.append('text')
+                .attr('x', x + wordBoxW / 2).attr('y', phraseY + wordBoxH / 2 + 5)
+                .attr('text-anchor', 'middle')
+                .attr('font-size', '14px')
+                .attr('font-weight', 'bold')
+                .attr('fill', '#1565C0')
+                .text(word);
+        }});
+
+        // Draw substitute rows below
+        const subGroup = svg.append('g');
+        const subWordW = 70;
+        const subWordH = 24;
+        const subWordGap = 3;
+        const ctxWordW = 55;
+
+        corpusData.substitutes.forEach((sub, si) => {{
+            const rowY = subStartY + si * subRowH;
+            const subWords = sub.words;
+            const leftCtx = sub.left_ctx || [];
+            const rightCtx = sub.right_ctx || [];
+
+            // Total width of this row
+            const ctxLeftW = leftCtx.length * (ctxWordW + subWordGap);
+            const subPhraseW = subWords.length * (subWordW + subWordGap) - subWordGap;
+            const ctxRightW = rightCtx.length * (ctxWordW + subWordGap);
+            const rowW = ctxLeftW + subPhraseW + ctxRightW + 20;
+            const rowX = (totalWidth - rowW) / 2;
+
+            let curX = rowX;
+
+            // Left context (grey)
+            leftCtx.forEach(w => {{
+                subGroup.append('text')
+                    .attr('x', curX + ctxWordW / 2).attr('y', rowY + subWordH / 2 + 4)
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '11px')
+                    .attr('fill', '#999')
+                    .text(w);
+                curX += ctxWordW + subWordGap;
+            }});
+
+            // Separator
+            if (leftCtx.length > 0) {{
+                subGroup.append('text')
+                    .attr('x', curX).attr('y', rowY + subWordH / 2 + 4)
+                    .attr('font-size', '11px').attr('fill', '#ccc')
+                    .text('|');
+                curX += 10;
+            }}
+
+            // Substitute word boxes
+            const subStartX = curX;
+            subWords.forEach((w, wi) => {{
+                subGroup.append('rect')
+                    .attr('x', curX).attr('y', rowY)
+                    .attr('width', subWordW).attr('height', subWordH)
+                    .attr('rx', 3)
+                    .attr('fill', sub.color + '22')
+                    .attr('stroke', sub.color)
+                    .attr('stroke-width', 1);
+
+                subGroup.append('text')
+                    .attr('x', curX + subWordW / 2).attr('y', rowY + subWordH / 2 + 4)
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '11px')
+                    .attr('font-weight', 'bold')
+                    .attr('fill', sub.color)
+                    .text(w);
+                curX += subWordW + subWordGap;
+            }});
+            const subEndX = curX - subWordGap;
+
+            // Separator
+            if (rightCtx.length > 0) {{
+                curX += 4;
+                subGroup.append('text')
+                    .attr('x', curX).attr('y', rowY + subWordH / 2 + 4)
+                    .attr('font-size', '11px').attr('fill', '#ccc')
+                    .text('|');
+                curX += 10;
+            }}
+
+            // Right context (grey)
+            rightCtx.forEach(w => {{
+                subGroup.append('text')
+                    .attr('x', curX + ctxWordW / 2).attr('y', rowY + subWordH / 2 + 4)
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '11px')
+                    .attr('fill', '#999')
+                    .text(w);
+                curX += ctxWordW + subWordGap;
+            }});
+
+            // Score label
+            subGroup.append('text')
+                .attr('x', curX + 10).attr('y', rowY + subWordH / 2 + 4)
+                .attr('font-size', '10px')
+                .attr('fill', '#999')
+                .text('(' + sub.score + ')');
+
+            // Draw connecting line from span arc down to substitute row
+            const spanMidX = phraseX + ((sub.span_start + sub.span_end) / 2) * (wordBoxW + wordGap) + wordBoxW / 2;
+            const subMidX = (subStartX + subEndX) / 2;
+
+            subGroup.append('path')
+                .attr('d', 'M ' + spanMidX + ' ' + (phraseY + wordBoxH) +
+                           ' C ' + spanMidX + ' ' + (rowY - 5) +
+                           ' ' + subMidX + ' ' + (phraseY + wordBoxH + 15) +
+                           ' ' + subMidX + ' ' + rowY)
+                .attr('fill', 'none')
+                .attr('stroke', sub.color)
+                .attr('stroke-width', 1)
+                .attr('stroke-dasharray', '4,3')
+                .attr('opacity', 0.5);
+        }});
+    }}
+    </script>
 </body>
 </html>
 """
