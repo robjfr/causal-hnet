@@ -1778,6 +1778,7 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
 <html>
 <head>
     <title>Parse Tree: {phrase}</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
         h1 {{ color: #333; }}
@@ -1811,6 +1812,20 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         .indent-3 {{ margin-left: 60px; }}
         .indent-4 {{ margin-left: 80px; }}
         .indent-5 {{ margin-left: 100px; }}
+        /* Tab styles */
+        .tab-bar {{ display: flex; gap: 0; margin-bottom: 0; }}
+        .tab-btn {{ padding: 12px 24px; border: 2px solid #ccc; border-bottom: none; background: #e0e0e0;
+                    cursor: pointer; font-size: 1em; font-weight: bold; border-radius: 8px 8px 0 0; color: #666; }}
+        .tab-btn.active {{ background: white; color: #2196F3; border-color: #2196F3; }}
+        .tab-panel {{ display: none; }}
+        .tab-panel.active {{ display: block; }}
+        #graph-view {{ background: white; border: 2px solid #2196F3; border-top: none; border-radius: 0 0 8px 8px;
+                       padding: 10px; min-height: 600px; }}
+        #graph-svg {{ width: 100%; height: 700px; }}
+        .graph-node-label {{ font-size: 12px; font-family: Arial, sans-serif; pointer-events: none; }}
+        .graph-tooltip {{ position: absolute; background: #333; color: white; padding: 8px 12px;
+                          border-radius: 4px; font-size: 12px; pointer-events: none; z-index: 1000;
+                          max-width: 350px; line-height: 1.4; }}
     </style>
     <script>
         function toggleNode(id) {{
@@ -1820,21 +1835,35 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
                 alert('Element not found: ' + id);
                 return;
             }}
-            // Check current display and toggle (works for both inline styles and CSS classes)
             const currentDisplay = window.getComputedStyle(el).display;
             console.log('toggleNode:', id, 'current display:', currentDisplay);
             if (currentDisplay === 'none') {{
                 el.style.display = 'block';
-                el.style.backgroundColor = '#fff9c4';  // Yellow highlight when opened
+                el.style.backgroundColor = '#fff9c4';
             }} else {{
                 el.style.display = 'none';
                 el.style.backgroundColor = '';
+            }}
+        }}
+        function switchTab(tabName) {{
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            document.querySelector('[data-tab="' + tabName + '"]').classList.add('active');
+            if (tabName === 'graph-view' && typeof initGraph === 'function' && !window._graphInitialized) {{
+                window._graphInitialized = true;
+                initGraph();
             }}
         }}
     </script>
 </head>
 <body>
     <h1>Parse Tree: "{phrase}"</h1>
+    <div class="tab-bar">
+        <button class="tab-btn active" data-tab="tree-view" onclick="switchTab('tree-view')">Tree View</button>
+        <button class="tab-btn" data-tab="graph-view" onclick="switchTab('graph-view')">Graph View</button>
+    </div>
+    <div id="tree-view" class="tab-panel active">
     <div class="tree">
 """
 
@@ -2377,6 +2406,278 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         html += '</div>'
 
     html += """
+    </div>
+    </div><!-- end tree-view tab -->
+"""
+
+    # Build graph data from the winning parse tree
+    import json as _json
+
+    graph_nodes = []
+    graph_edges = []
+    node_set = set()
+
+    def add_graph_node(span_text, depth, node_type='span'):
+        if span_text in node_set:
+            return
+        node_set.add(span_text)
+
+        subs, left_ctx, right_ctx, energy, split, origins = get_best_parse(subparse_cache, span_text)
+        num_subs = len(subs) if subs else 0
+        word_count = len(span_text.split())
+
+        # Get top contexts
+        top_left = left_ctx[:5] if left_ctx else []
+        top_right = right_ctx[:5] if right_ctx else []
+
+        graph_nodes.append({
+            'id': span_text,
+            'label': span_text,
+            'type': node_type,
+            'energy': round(energy, 2) if energy != float('inf') else None,
+            'num_subs': num_subs,
+            'depth': depth,
+            'word_count': word_count,
+            'left_ctx': top_left,
+            'right_ctx': top_right,
+        })
+
+        # Add top substitutes grouped by word length
+        if subs:
+            from collections import defaultdict
+            by_len = defaultdict(list)
+            for s_text, s_score in subs:
+                by_len[len(s_text.split())].append((s_text, s_score))
+            for wlen in sorted(by_len.keys()):
+                top_for_len = sorted(by_len[wlen], key=lambda x: -x[1])[:5]
+                for s_text, s_score in top_for_len:
+                    sub_id = f"sub:{span_text}:{s_text}"
+                    if sub_id not in node_set:
+                        node_set.add(sub_id)
+                        graph_nodes.append({
+                            'id': sub_id,
+                            'label': s_text,
+                            'type': 'substitute',
+                            'score': round(s_score, 3),
+                            'parent': span_text,
+                            'depth': depth,
+                            'word_count': len(s_text.split()),
+                        })
+                        graph_edges.append({
+                            'source': span_text,
+                            'target': sub_id,
+                            'type': 'substitution',
+                        })
+
+        # Recurse into children
+        if split and isinstance(split, tuple) and len(split) == 2:
+            if split[0] not in ['aggregation', 'expansion']:
+                left_text, right_text = split
+                add_graph_node(left_text, depth + 1, 'span' if ' ' in left_text else 'leaf')
+                add_graph_node(right_text, depth + 1, 'span' if ' ' in right_text else 'leaf')
+                graph_edges.append({'source': span_text, 'target': left_text, 'type': 'split'})
+                graph_edges.append({'source': span_text, 'target': right_text, 'type': 'split'})
+
+    # Walk from root
+    root_text = phrase.lower()
+    add_graph_node(root_text, 0)
+
+    graph_data = _json.dumps({'nodes': graph_nodes, 'edges': graph_edges})
+
+
+    html += f"""
+	<div id="graph-view" class="tab-panel">
+		<div style="margin-bottom:10px;padding:5px;background:#fafafa;border-radius:6px;font-size:13px;line-height:1.2;">
+			<strong style="color:#333;">Legend: </strong>
+			<span style="margin-right:8px;"><svg width="12" height="12" style="vertical-align:middle;"><circle cx="6" cy="6" r="5" fill="#4CAF50" stroke="#333" stroke-width="1.5"/></svg> Low energy (good)</span>
+			<span style="margin-right:8px;"><svg width="12" height="12" style="vertical-align:middle;"><circle cx="6" cy="6" r="5" fill="#FF5722" stroke="#333" stroke-width="1.5"/></svg> High energy (poor)</span>
+			<span style="margin-right:8px;"><svg width="10" height="10" style="vertical-align:middle;"><circle cx="5" cy="5" r="4" fill="#E8F5E9" stroke="#388E3C" stroke-width="1"/></svg> Leaf</span>
+			<span style="margin-right:8px;"><svg width="10" height="10" style="vertical-align:middle;"><circle cx="5" cy="5" r="4" fill="#B3E5FC" stroke="#0288D1" stroke-width="1"/></svg> Substitute (click span to show)</span>
+			<span style="margin-right:8px;"><svg width="20" height="10" style="vertical-align:middle;"><line x1="0" y1="5" x2="20" y2="5" stroke="#333" stroke-width="2.5"/></svg> Split</span>
+			<span style="margin-right:8px;"><svg width="20" height="10" style="vertical-align:middle;"><line x1="0" y1="5" x2="20" y2="5" stroke="#bbb" stroke-width="1" stroke-dasharray="4,3"/></svg> Substitution</span>
+			Node size = substitute count
+		</div>
+		<svg id="graph-svg"></svg>
+		<div id="graph-tooltip" class="graph-tooltip" style="display:none;"></div>
+	</div>
+
+
+
+    <script>
+    const graphData = {graph_data};
+
+    function initGraph() {{
+        const svg = d3.select('#graph-svg');
+        const width = svg.node().getBoundingClientRect().width || 1200;
+        const height = 700;
+        svg.attr('viewBox', [0, 0, width, height]);
+
+        const tooltip = d3.select('#graph-tooltip');
+
+        // Separate span/leaf nodes from substitute nodes
+        const spanNodes = graphData.nodes.filter(n => n.type !== 'substitute');
+        const subNodes = graphData.nodes.filter(n => n.type === 'substitute');
+
+        // Initially hide substitutes
+        subNodes.forEach(n => n.hidden = true);
+
+        // Color scale for energy (green=low/good, red=high/bad)
+        const energies = spanNodes.map(n => n.energy).filter(e => e !== null);
+        const eMin = d3.min(energies) || -15;
+        const eMax = d3.max(energies) || 0;
+        const colorScale = d3.scaleLinear()
+            .domain([eMin, (eMin + eMax) / 2, eMax])
+            .range(['#4CAF50', '#FFC107', '#FF5722']);
+
+        // Size scale for nodes
+        const sizeScale = d3.scaleSqrt()
+            .domain([0, d3.max(spanNodes, n => n.num_subs) || 100])
+            .range([15, 45]);
+
+        // Build links with references
+        const allLinks = graphData.edges.map(e => ({{...e}}));
+
+        // Force simulation
+        const simulation = d3.forceSimulation(graphData.nodes)
+            .force('link', d3.forceLink(allLinks).id(d => d.id)
+                .distance(d => d.type === 'split' ? 120 : 60)
+                .strength(d => d.type === 'split' ? 1.0 : 0.3))
+            .force('charge', d3.forceManyBody().strength(d => d.type === 'substitute' ? -30 : -200))
+            .force('y', d3.forceY(d => {{
+                if (d.type === 'substitute') return height * 0.3 + (d.depth || 0) * 100;
+                return 80 + (d.depth || 0) * 130;
+            }}).strength(0.3))
+            .force('x', d3.forceX(width / 2).strength(0.05))
+            .force('collide', d3.forceCollide(d => d.type === 'substitute' ? 8 : sizeScale(d.num_subs || 0) + 5));
+
+        // Arrow markers
+        svg.append('defs').selectAll('marker')
+            .data(['split', 'substitution'])
+            .join('marker')
+            .attr('id', d => 'arrow-' + d)
+            .attr('viewBox', '0 -5 10 10')
+            .attr('refX', 15).attr('refY', 0)
+            .attr('markerWidth', 6).attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M0,-5L10,0L0,5')
+            .attr('fill', d => d === 'split' ? '#333' : '#aaa');
+
+        // Container for zoom
+        const g = svg.append('g');
+
+        svg.call(d3.zoom()
+            .scaleExtent([0.3, 4])
+            .on('zoom', e => g.attr('transform', e.transform)));
+
+        // Links
+        const link = g.append('g').selectAll('line')
+            .data(allLinks)
+            .join('line')
+            .attr('stroke', d => d.type === 'split' ? '#333' : '#bbb')
+            .attr('stroke-width', d => d.type === 'split' ? 2.5 : 1)
+            .attr('stroke-dasharray', d => d.type === 'substitution' ? '4,3' : null)
+            .attr('marker-end', d => 'url(#arrow-' + d.type + ')');
+
+        // Nodes
+        const node = g.append('g').selectAll('g')
+            .data(graphData.nodes)
+            .join('g')
+            .attr('class', 'graph-node')
+            .style('display', d => d.hidden ? 'none' : null)
+            .call(d3.drag()
+                .on('start', (e, d) => {{ if (!e.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; }})
+                .on('drag', (e, d) => {{ d.fx = e.x; d.fy = e.y; }})
+                .on('end', (e, d) => {{ if (!e.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; }}));
+
+        // Circles
+        node.append('circle')
+            .attr('r', d => {{
+                if (d.type === 'substitute') return 6;
+                return sizeScale(d.num_subs || 0);
+            }})
+            .attr('fill', d => {{
+                if (d.type === 'substitute') return '#B3E5FC';
+                if (d.type === 'leaf') return '#E8F5E9';
+                return d.energy !== null ? colorScale(d.energy) : '#ccc';
+            }})
+            .attr('stroke', d => {{
+                if (d.type === 'substitute') return '#0288D1';
+                if (d.type === 'leaf') return '#388E3C';
+                return '#333';
+            }})
+            .attr('stroke-width', d => d.type === 'substitute' ? 1 : 2);
+
+        // Labels
+        node.append('text')
+            .attr('class', 'graph-node-label')
+            .attr('dy', d => d.type === 'substitute' ? -10 : -(sizeScale(d.num_subs || 0) + 5))
+            .attr('text-anchor', 'middle')
+            .text(d => d.label)
+            .style('font-size', d => d.type === 'substitute' ? '10px' : '13px')
+            .style('font-weight', d => d.type === 'substitute' ? 'normal' : 'bold');
+
+        // Energy labels inside span nodes
+        node.filter(d => d.type === 'span' && d.energy !== null)
+            .append('text')
+            .attr('text-anchor', 'middle')
+            .attr('dy', 4)
+            .style('font-size', '10px')
+            .style('fill', 'white')
+            .style('font-weight', 'bold')
+            .style('pointer-events', 'none')
+            .text(d => 'E=' + d.energy);
+
+        // Hover tooltips
+        node.on('mouseover', (e, d) => {{
+            let html = '<strong>' + d.label + '</strong><br>';
+            if (d.type === 'substitute') {{
+                html += 'Score: ' + (d.score || 'N/A') + '<br>';
+                html += 'Words: ' + d.word_count;
+            }} else {{
+                if (d.energy !== null) html += 'Energy: ' + d.energy + '<br>';
+                html += 'Substitutes: ' + (d.num_subs || 0) + '<br>';
+                html += 'Words: ' + d.word_count;
+                if (d.left_ctx && d.left_ctx.length) html += '<br>L: ' + d.left_ctx.join(', ');
+                if (d.right_ctx && d.right_ctx.length) html += '<br>R: ' + d.right_ctx.join(', ');
+            }}
+            tooltip.html(html)
+                .style('display', 'block')
+                .style('left', (e.pageX + 15) + 'px')
+                .style('top', (e.pageY - 10) + 'px');
+        }})
+        .on('mouseout', () => tooltip.style('display', 'none'));
+
+        // Click span nodes to toggle substitute visibility
+        node.filter(d => d.type !== 'substitute').on('click', (e, d) => {{
+            const subs = graphData.nodes.filter(n => n.type === 'substitute' && n.parent === d.id);
+            const subIds = new Set(subs.map(n => n.id));
+            const showing = !subs[0]?.hidden;
+            subs.forEach(n => n.hidden = showing);
+
+            node.filter(nd => subIds.has(nd.id))
+                .style('display', nd => nd.hidden ? 'none' : null);
+            link.style('display', l => {{
+                const sid = typeof l.source === 'object' ? l.source.id : l.source;
+                const tid = typeof l.target === 'object' ? l.target.id : l.target;
+                const sn = graphData.nodes.find(n => n.id === sid);
+                const tn = graphData.nodes.find(n => n.id === tid);
+                if ((sn && sn.hidden) || (tn && tn.hidden)) return 'none';
+                return null;
+            }});
+
+            simulation.alpha(0.3).restart();
+        }});
+
+        // Tick
+        simulation.on('tick', () => {{
+            link
+                .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+                .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+            node.attr('transform', d => 'translate(' + d.x + ',' + d.y + ')');
+        }});
+    }}
+    </script>
     </div>
 </body>
 </html>
