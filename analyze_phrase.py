@@ -1829,6 +1829,9 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         #corpus-view {{ background: white; border: 2px solid #2196F3; border-top: none;
                         border-radius: 0 0 8px 8px; padding: 20px; min-height: 400px; }}
         #corpus-svg {{ width: 100%; overflow: visible; }}
+        #containment-view {{ background: white; border: 2px solid #2196F3; border-top: none;
+                             border-radius: 0 0 8px 8px; padding: 10px; min-height: 600px; }}
+        #containment-svg {{ width: 100%; height: 800px; }}
     </style>
     <script>
         function toggleNode(id) {{
@@ -1861,6 +1864,10 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
                 window._corpusInitialized = true;
                 initCorpusView();
             }}
+            if (tabName === 'containment-view' && typeof initContainmentView === 'function' && !window._containmentInitialized) {{
+                window._containmentInitialized = true;
+                initContainmentView();
+            }}
         }}
     </script>
 </head>
@@ -1870,6 +1877,7 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         <button class="tab-btn active" data-tab="tree-view" onclick="switchTab('tree-view')">Tree View</button>
         <button class="tab-btn" data-tab="graph-view" onclick="switchTab('graph-view')">Graph View</button>
         <button class="tab-btn" data-tab="corpus-view" onclick="switchTab('corpus-view')">Corpus View</button>
+        <button class="tab-btn" data-tab="containment-view" onclick="switchTab('containment-view')">Containment View</button>
     </div>
     <div id="tree-view" class="tab-panel active">
     <div class="tree">
@@ -2985,6 +2993,386 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
                 .attr('stroke-dasharray', '4,3')
                 .attr('opacity', 0.5);
         }});
+    }}
+    </script>
+"""
+
+    # Build containment view data
+    _color_idx = [0]
+
+    def build_containment_hierarchy(span_text, depth=0):
+        """Build a hierarchy dict for D3 circle packing."""
+        words = span_text.split()
+        color = arc_colors[_color_idx[0] % len(arc_colors)]
+
+        subs, left_ctx, right_ctx, energy, split, origins = get_best_parse(subparse_cache, span_text)
+        num_subs = len(subs) if subs else 0
+
+        node = {
+            'id': span_text,
+            'label': span_text,
+            'energy': round(energy, 2) if energy != float('inf') else None,
+            'num_subs': num_subs,
+            'color': color,
+            'type': 'span',
+            'children': [],
+        }
+
+        if len(words) < 2 or not split:
+            # Leaf word — no children, just a value for packing
+            node['type'] = 'word'
+            node['value'] = 10
+            return node
+
+        _color_idx[0] += 1
+
+        # Add child spans / leaf words
+        if split and isinstance(split, tuple) and len(split) == 2 and split[0] not in ['aggregation', 'expansion']:
+            left_text, right_text = split
+            if ' ' in left_text:
+                node['children'].append(build_containment_hierarchy(left_text, depth + 1))
+            else:
+                node['children'].append({
+                    'id': f'word:{left_text}:{span_text}',
+                    'label': left_text,
+                    'type': 'word',
+                    'color': '#1565C0',
+                    'value': 10,
+                })
+            if ' ' in right_text:
+                node['children'].append(build_containment_hierarchy(right_text, depth + 1))
+            else:
+                node['children'].append({
+                    'id': f'word:{right_text}:{span_text}',
+                    'label': right_text,
+                    'type': 'word',
+                    'color': '#1565C0',
+                    'value': 10,
+                })
+
+        # Add top substitutes
+        if subs:
+            from collections import defaultdict as _dl
+            by_len = _dl(list)
+            for s_text, s_score in subs:
+                by_len[len(s_text.split())].append((s_text, s_score))
+            full_len = len(words)
+            picked = []
+            if full_len in by_len:
+                picked.extend(sorted(by_len[full_len], key=lambda x: -x[1])[:3])
+            for wlen in sorted(by_len.keys()):
+                if wlen != full_len and len(picked) < 5:
+                    picked.extend(sorted(by_len[wlen], key=lambda x: -x[1])[:1])
+
+            for s_text, s_score in picked[:5]:
+                node['children'].append({
+                    'id': f'sub:{span_text}:{s_text}',
+                    'label': s_text,
+                    'type': 'substitute',
+                    'score': round(s_score, 3),
+                    'color': color,
+                    'value': 6,
+                })
+
+        return node
+
+    containment_hierarchy = build_containment_hierarchy(phrase.lower())
+
+    # Build sequences
+    containment_sequences = []
+
+    # Input phrase sequence — map words to their node IDs in the hierarchy
+    def find_word_ids(node, word_list, idx=0):
+        """Find node IDs for sequential input words in the hierarchy."""
+        ids = {}
+        def walk(n):
+            if n.get('type') == 'word' and n['label'] in word_list:
+                # Match to earliest unmatched position
+                for i, w in enumerate(word_list):
+                    if w == n['label'] and i not in ids:
+                        ids[i] = n['id']
+                        break
+            for c in n.get('children', []):
+                walk(c)
+        walk(node)
+        return [ids.get(i, f'word:{w}') for i, w in enumerate(word_list)]
+
+    input_word_ids = find_word_ids(containment_hierarchy, corpus_words)
+    containment_sequences.append({
+        'words': corpus_words,
+        'node_ids': input_word_ids,
+        'type': 'input',
+        'color': '#1565C0',
+    })
+
+    # Substitute sequences with corpus context
+    def collect_sub_sequences(node):
+        if node.get('type') != 'span':
+            return
+        color = node.get('color', '#666')
+        for child in node.get('children', []):
+            if child.get('type') == 'substitute':
+                s_text = child['label']
+                left_ctx_words = []
+                right_ctx_words = []
+                if corpus_index and s_text in corpus_index.ngram_index:
+                    positions = corpus_index.ngram_index[s_text]
+                    if positions:
+                        pos = positions[0]
+                        s_len = len(s_text.split())
+                        lstart = max(0, pos - 3)
+                        left_ctx_words = [t for t in corpus_index.tokens[lstart:pos]
+                                          if not t.startswith('__')]
+                        rend = min(len(corpus_index.tokens), pos + s_len + 3)
+                        right_ctx_words = [t for t in corpus_index.tokens[pos + s_len:rend]
+                                           if not t.startswith('__')]
+                elif hasattr(catalog, 'units') and s_text in catalog.units:
+                    pattern = catalog.get_unit(s_text)
+                    if pattern:
+                        left_ctx_words = [w for w, c in pattern.left_words.most_common(2)]
+                        right_ctx_words = [w for w, c in pattern.right_words.most_common(2)]
+
+                containment_sequences.append({
+                    'words': s_text.split(),
+                    'node_id': child['id'],
+                    'parent_span': node['id'],
+                    'type': 'substitute',
+                    'color': color,
+                    'left_ctx': left_ctx_words[:2],
+                    'right_ctx': right_ctx_words[:2],
+                })
+            elif child.get('type') == 'span':
+                collect_sub_sequences(child)
+
+    collect_sub_sequences(containment_hierarchy)
+
+    containment_data = _json.dumps({
+        'hierarchy': containment_hierarchy,
+        'sequences': containment_sequences,
+    })
+
+    html += f"""
+    <div id="containment-view" class="tab-panel">
+        <svg id="containment-svg"></svg>
+        <div id="containment-tooltip" class="graph-tooltip" style="display:none;"></div>
+    </div>
+    <script>
+    const containmentData = {containment_data};
+
+    function initContainmentView() {{
+        const svg = d3.select('#containment-svg');
+        const width = svg.node().parentNode.getBoundingClientRect().width - 20 || 1200;
+        const height = 800;
+        svg.attr('viewBox', [0, 0, width, height]);
+
+        const tooltip = d3.select('#containment-tooltip');
+
+        // Build D3 hierarchy and pack layout
+        const root = d3.hierarchy(containmentData.hierarchy)
+            .sum(d => d.value || 0)
+            .sort((a, b) => (b.value || 0) - (a.value || 0));
+
+        const pack = d3.pack()
+            .size([width - 40, height - 120])
+            .padding(d => d.depth === 0 ? 20 : 12);
+
+        pack(root);
+
+        // Offset to center
+        const ox = 20;
+        const oy = 60;
+
+        const g = svg.append('g');
+
+        // Zoom
+        svg.call(d3.zoom()
+            .scaleExtent([0.3, 4])
+            .on('zoom', e => g.attr('transform', e.transform)));
+
+        // Draw containment circles (spans only — those with children)
+        const spanNodes = root.descendants().filter(d => d.data.type === 'span' && d.children);
+        g.selectAll('.containment-circle')
+            .data(spanNodes)
+            .join('circle')
+            .attr('class', 'containment-circle')
+            .attr('cx', d => d.x + ox)
+            .attr('cy', d => d.y + oy)
+            .attr('r', d => d.r)
+            .attr('fill', d => d.data.color + '08')
+            .attr('stroke', d => d.data.color)
+            .attr('stroke-width', 2)
+            .attr('stroke-dasharray', d => d.depth === 0 ? null : '6,3');
+
+        // Energy labels on containment circles
+        g.selectAll('.energy-label')
+            .data(spanNodes)
+            .join('text')
+            .attr('x', d => d.x + ox)
+            .attr('y', d => d.y + oy - d.r + 14)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '11px')
+            .attr('font-weight', 'bold')
+            .attr('fill', d => d.data.color)
+            .text(d => {{
+                let t = d.data.label;
+                if (t.length > 25) t = t.substring(0, 22) + '...';
+                return t + (d.data.energy !== null ? ' (E=' + d.data.energy + ')' : '');
+            }});
+
+        // Draw leaf nodes (words and substitutes)
+        const leafNodes = root.leaves();
+
+        // Build ID→position map for sequence drawing
+        const nodePositions = {{}};
+        leafNodes.forEach(d => {{
+            nodePositions[d.data.id] = {{ x: d.x + ox, y: d.y + oy }};
+        }});
+
+        // Word nodes
+        const wordLeaves = leafNodes.filter(d => d.data.type === 'word');
+        g.selectAll('.word-node')
+            .data(wordLeaves)
+            .join('circle')
+            .attr('cx', d => d.x + ox)
+            .attr('cy', d => d.y + oy)
+            .attr('r', 14)
+            .attr('fill', '#E3F2FD')
+            .attr('stroke', '#1565C0')
+            .attr('stroke-width', 2);
+
+        g.selectAll('.word-label')
+            .data(wordLeaves)
+            .join('text')
+            .attr('x', d => d.x + ox)
+            .attr('y', d => d.y + oy + 4)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '12px')
+            .attr('font-weight', 'bold')
+            .attr('fill', '#1565C0')
+            .text(d => d.data.label);
+
+        // Substitute nodes
+        const subLeaves = leafNodes.filter(d => d.data.type === 'substitute');
+        g.selectAll('.sub-node')
+            .data(subLeaves)
+            .join('circle')
+            .attr('cx', d => d.x + ox)
+            .attr('cy', d => d.y + oy)
+            .attr('r', 10)
+            .attr('fill', d => d.data.color + '33')
+            .attr('stroke', d => d.data.color)
+            .attr('stroke-width', 1.5);
+
+        g.selectAll('.sub-label')
+            .data(subLeaves)
+            .join('text')
+            .attr('x', d => d.x + ox)
+            .attr('y', d => d.y + oy + 18)
+            .attr('text-anchor', 'middle')
+            .attr('font-size', '9px')
+            .attr('fill', d => d.data.color)
+            .text(d => {{
+                let t = d.data.label;
+                if (t.length > 20) t = t.substring(0, 18) + '...';
+                return t;
+            }});
+
+        // Draw sequence links
+        const linkGen = d3.line().curve(d3.curveBasis);
+
+        // Input phrase sequence
+        const inputSeq = containmentData.sequences.find(s => s.type === 'input');
+        if (inputSeq) {{
+            const points = inputSeq.node_ids
+                .map(id => nodePositions[id])
+                .filter(p => p);
+            if (points.length > 1) {{
+                g.append('path')
+                    .attr('d', linkGen(points.map(p => [p.x, p.y])))
+                    .attr('fill', 'none')
+                    .attr('stroke', '#1565C0')
+                    .attr('stroke-width', 2.5)
+                    .attr('opacity', 0.6);
+
+                // Arrow indicators between consecutive words
+                for (let i = 0; i < points.length - 1; i++) {{
+                    const mx = (points[i].x + points[i+1].x) / 2;
+                    const my = (points[i].y + points[i+1].y) / 2;
+                    const angle = Math.atan2(points[i+1].y - points[i].y, points[i+1].x - points[i].x);
+                    g.append('polygon')
+                        .attr('points', '-4,-3 4,0 -4,3')
+                        .attr('fill', '#1565C0')
+                        .attr('opacity', 0.5)
+                        .attr('transform', 'translate(' + mx + ',' + my + ') rotate(' + (angle * 180 / Math.PI) + ')');
+                }}
+            }}
+        }}
+
+        // Substitute sequences — draw from context through substitute node
+        containmentData.sequences.filter(s => s.type === 'substitute').forEach(seq => {{
+            const subPos = nodePositions[seq.node_id];
+            if (!subPos) return;
+
+            const allWords = (seq.left_ctx || []).concat(seq.words).concat(seq.right_ctx || []);
+            const ctxLen = (seq.left_ctx || []).length;
+            const subLen = seq.words.length;
+
+            // Lay out sequence words horizontally centered on the substitute node
+            const wordSpacing = 28;
+            const totalW = (allWords.length - 1) * wordSpacing;
+            const startX = subPos.x - totalW / 2;
+            const seqY = subPos.y + 30;
+
+            const seqPoints = allWords.map((w, i) => ({{
+                x: startX + i * wordSpacing,
+                y: seqY,
+                word: w,
+                isCtx: i < ctxLen || i >= ctxLen + subLen,
+            }}));
+
+            // Draw sequence line
+            if (seqPoints.length > 1) {{
+                g.append('path')
+                    .attr('d', linkGen(seqPoints.map(p => [p.x, p.y])))
+                    .attr('fill', 'none')
+                    .attr('stroke', seq.color)
+                    .attr('stroke-width', 1)
+                    .attr('opacity', 0.4)
+                    .attr('stroke-dasharray', '3,2');
+            }}
+
+            // Draw word labels along sequence
+            seqPoints.forEach(p => {{
+                g.append('text')
+                    .attr('x', p.x).attr('y', p.y + 4)
+                    .attr('text-anchor', 'middle')
+                    .attr('font-size', '8px')
+                    .attr('fill', p.isCtx ? '#aaa' : seq.color)
+                    .attr('font-weight', p.isCtx ? 'normal' : 'bold')
+                    .text(p.word);
+            }});
+        }});
+
+        // Tooltips
+        g.selectAll('circle').on('mouseover', function(e) {{
+            const d = d3.select(this).datum();
+            if (!d || !d.data) return;
+            let html = '<strong>' + d.data.label + '</strong><br>';
+            if (d.data.type === 'substitute') {{
+                html += 'Score: ' + (d.data.score || '') + '<br>';
+                html += 'Type: substitute';
+            }} else if (d.data.type === 'span') {{
+                if (d.data.energy !== null) html += 'Energy: ' + d.data.energy + '<br>';
+                html += 'Substitutes: ' + (d.data.num_subs || 0);
+            }} else {{
+                html += 'Input word';
+            }}
+            tooltip.html(html)
+                .style('display', 'block')
+                .style('left', (e.pageX + 12) + 'px')
+                .style('top', (e.pageY - 10) + 'px');
+        }})
+        .on('mouseout', () => tooltip.style('display', 'none'));
     }}
     </script>
 </body>
