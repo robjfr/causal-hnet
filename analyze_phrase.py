@@ -3000,8 +3000,27 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
     # Build containment view data
     _color_idx = [0]
 
-    def build_containment_hierarchy(span_text, depth=0):
-        """Build a hierarchy dict for D3 circle packing."""
+    def _find_span_pos(span_text):
+        """Find start position of span in the input phrase."""
+        span_words = span_text.split()
+        for i in range(len(corpus_words) - len(span_words) + 1):
+            if corpus_words[i:i+len(span_words)] == span_words:
+                return i
+        return 999  # fallback: push unknowns to end
+
+    # Track substitute decompositions for building sequence links
+    # Each entry: { 'seq_id': str, 'node_ids': [str,...], 'color': str, 'full_text': str }
+    _sub_sequences = []
+    _seq_counter = [0]
+    _sub_node_registry = {}  # (span_ctx, input_word, sub_word) -> node_id
+
+    def build_containment_hierarchy(span_text, depth=0, inherited_subs=None):
+        """Build a hierarchy dict for D3 circle packing.
+
+        inherited_subs: list of (sub_text, score, origin_color, seq_id, seq_pos) pushed
+            down from parent. seq_id groups parts of the same original substitute;
+            seq_pos is the word position within the full substitute.
+        """
         words = span_text.split()
         color = arc_colors[_color_idx[0] % len(arc_colors)]
 
@@ -3015,6 +3034,7 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
             'num_subs': num_subs,
             'color': color,
             'type': 'span',
+            'pos': _find_span_pos(span_text),
             'children': [],
         }
 
@@ -3026,53 +3046,130 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
 
         _color_idx[0] += 1
 
-        # Add child spans / leaf words
-        if split and isinstance(split, tuple) and len(split) == 2 and split[0] not in ['aggregation', 'expansion']:
-            left_text, right_text = split
-            if ' ' in left_text:
-                node['children'].append(build_containment_hierarchy(left_text, depth + 1))
-            else:
-                node['children'].append({
-                    'id': f'word:{left_text}:{span_text}',
-                    'label': left_text,
-                    'type': 'word',
-                    'color': '#1565C0',
-                    'value': 10,
-                })
-            if ' ' in right_text:
-                node['children'].append(build_containment_hierarchy(right_text, depth + 1))
-            else:
-                node['children'].append({
-                    'id': f'word:{right_text}:{span_text}',
-                    'label': right_text,
-                    'type': 'word',
-                    'color': '#1565C0',
-                    'value': 10,
-                })
-
-        # Add top substitutes
+        # Pick top substitutes at this level to decompose downward
+        from collections import defaultdict as _dl
+        picked_subs = []
         if subs:
-            from collections import defaultdict as _dl
             by_len = _dl(list)
             for s_text, s_score in subs:
                 by_len[len(s_text.split())].append((s_text, s_score))
             full_len = len(words)
-            picked = []
             if full_len in by_len:
-                picked.extend(sorted(by_len[full_len], key=lambda x: -x[1])[:3])
+                picked_subs.extend(sorted(by_len[full_len], key=lambda x: -x[1])[:3])
             for wlen in sorted(by_len.keys()):
-                if wlen != full_len and len(picked) < 5:
-                    picked.extend(sorted(by_len[wlen], key=lambda x: -x[1])[:1])
+                if wlen != full_len and len(picked_subs) < 5:
+                    picked_subs.extend(sorted(by_len[wlen], key=lambda x: -x[1])[:1])
+            picked_subs = picked_subs[:5]
 
-            for s_text, s_score in picked[:5]:
-                node['children'].append({
-                    'id': f'sub:{span_text}:{s_text}',
-                    'label': s_text,
-                    'type': 'substitute',
-                    'score': round(s_score, 3),
-                    'color': color,
-                    'value': 6,
-                })
+        # Determine split structure
+        if split and isinstance(split, tuple) and len(split) == 2 and split[0] not in ['aggregation', 'expansion']:
+            left_text, right_text = split
+            left_len = len(left_text.split())
+            right_len = len(right_text.split())
+
+            # Assign seq_ids to this span's own substitutes and split them
+            left_inherited = []
+            right_inherited = []
+
+            span_start = _find_span_pos(span_text)
+            span_end = span_start + len(words) - 1
+
+            for s_text, s_score in picked_subs:
+                s_words = s_text.split()
+                if len(s_words) == left_len + right_len:
+                    seq_id = f'seq_{_seq_counter[0]}'
+                    _seq_counter[0] += 1
+                    # Register this sequence (node_ids filled in later at leaf level)
+                    _sub_sequences.append({
+                        'seq_id': seq_id,
+                        'full_text': s_text,
+                        'color': color,
+                        'node_ids': [],  # filled as leaves are created
+                        'span_start': span_start,
+                        'span_end': span_end,
+                    })
+                    left_part = ' '.join(s_words[:left_len])
+                    right_part = ' '.join(s_words[left_len:])
+                    # seq_pos = starting word index within the full substitute
+                    left_inherited.append((left_part, s_score, color, seq_id, 0))
+                    right_inherited.append((right_part, s_score, color, seq_id, left_len))
+
+            # Split inherited subs from parent
+            if inherited_subs:
+                for s_text, s_score, s_color, seq_id, seq_pos in inherited_subs:
+                    s_words = s_text.split()
+                    if len(s_words) == left_len + right_len:
+                        left_part = ' '.join(s_words[:left_len])
+                        right_part = ' '.join(s_words[left_len:])
+                        left_inherited.append((left_part, s_score, s_color, seq_id, seq_pos))
+                        right_inherited.append((right_part, s_score, s_color, seq_id, seq_pos + left_len))
+
+            # Helper to add leaf substitute nodes and register them in sequences
+            # Shared registry: reuse nodes when the same word substitutes at the same position
+            def add_leaf_subs(parent_node, input_word, span_ctx, inherited_parts, input_pos, input_node_id):
+                for s_part, s_score, s_color, seq_id, seq_pos in inherited_parts:
+                    if s_part == input_word:
+                        # Same word as input — link sequence to the input word node
+                        for seq_entry in _sub_sequences:
+                            if seq_entry['seq_id'] == seq_id:
+                                seq_entry['node_ids'].append((seq_pos, input_node_id))
+                                break
+                    else:
+                        # Key without seq_id — same word at same position shares a node
+                        node_key = (span_ctx, input_word, s_part)
+                        if node_key in _sub_node_registry:
+                            # Reuse existing node
+                            node_id = _sub_node_registry[node_key]
+                        else:
+                            # Create new node
+                            node_id = f'sub:{span_ctx}:{input_word}:{s_part}'
+                            _sub_node_registry[node_key] = node_id
+                            parent_node['children'].append({
+                                'id': node_id,
+                                'label': s_part,
+                                'type': 'substitute',
+                                'score': round(s_score, 3),
+                                'color': s_color,
+                                'pos': input_pos,
+                                'value': 6,
+                            })
+                        # Register in the sequence tracker
+                        for seq_entry in _sub_sequences:
+                            if seq_entry['seq_id'] == seq_id:
+                                seq_entry['node_ids'].append((seq_pos, node_id))
+                                break
+
+            # Build left child
+            left_pos = _find_span_pos(left_text)
+            if ' ' in left_text:
+                node['children'].append(build_containment_hierarchy(left_text, depth + 1, left_inherited))
+            else:
+                left_node = {
+                    'id': f'word:{left_text}:{span_text}',
+                    'label': left_text,
+                    'type': 'word',
+                    'color': '#1565C0',
+                    'pos': left_pos,
+                    'value': 10,
+                }
+                node['children'].append(left_node)
+                add_leaf_subs(node, left_text, span_text, left_inherited, left_pos, left_node['id'])
+
+            # Build right child
+            right_pos = _find_span_pos(right_text)
+            if ' ' in right_text:
+                node['children'].append(build_containment_hierarchy(right_text, depth + 1, right_inherited))
+            else:
+                right_node = {
+                    'id': f'word:{right_text}:{span_text}',
+                    'label': right_text,
+                    'type': 'word',
+                    'color': '#1565C0',
+                    'pos': right_pos,
+                    'value': 10,
+                }
+                node['children'].append(right_node)
+                add_leaf_subs(node, right_text, span_text, right_inherited, right_pos, right_node['id'])
 
         return node
 
@@ -3105,46 +3202,34 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         'color': '#1565C0',
     })
 
-    # Substitute sequences with corpus context
-    def collect_sub_sequences(node):
-        if node.get('type') != 'span':
-            return
-        color = node.get('color', '#666')
-        for child in node.get('children', []):
-            if child.get('type') == 'substitute':
-                s_text = child['label']
-                left_ctx_words = []
-                right_ctx_words = []
-                if corpus_index and s_text in corpus_index.ngram_index:
-                    positions = corpus_index.ngram_index[s_text]
-                    if positions:
-                        pos = positions[0]
-                        s_len = len(s_text.split())
-                        lstart = max(0, pos - 3)
-                        left_ctx_words = [t for t in corpus_index.tokens[lstart:pos]
-                                          if not t.startswith('__')]
-                        rend = min(len(corpus_index.tokens), pos + s_len + 3)
-                        right_ctx_words = [t for t in corpus_index.tokens[pos + s_len:rend]
-                                           if not t.startswith('__')]
-                elif hasattr(catalog, 'units') and s_text in catalog.units:
-                    pattern = catalog.get_unit(s_text)
-                    if pattern:
-                        left_ctx_words = [w for w, c in pattern.left_words.most_common(2)]
-                        right_ctx_words = [w for w, c in pattern.right_words.most_common(2)]
+    # Build substitute sequences from tracked decompositions
+    # Extend each with neighboring input word nodes for context
+    for seq_entry in _sub_sequences:
+        if not seq_entry['node_ids']:
+            continue
+        # Sort by seq_pos to get correct word order
+        sorted_parts = sorted(seq_entry['node_ids'], key=lambda x: x[0])
+        node_ids = [nid for _, nid in sorted_parts]
+        full_words = list(seq_entry['full_text'].split())
 
-                containment_sequences.append({
-                    'words': s_text.split(),
-                    'node_id': child['id'],
-                    'parent_span': node['id'],
-                    'type': 'substitute',
-                    'color': color,
-                    'left_ctx': left_ctx_words[:2],
-                    'right_ctx': right_ctx_words[:2],
-                })
-            elif child.get('type') == 'span':
-                collect_sub_sequences(child)
+        span_start = seq_entry.get('span_start', 0)
+        span_end = seq_entry.get('span_end', len(corpus_words) - 1)
 
-    collect_sub_sequences(containment_hierarchy)
+        # Prepend input word(s) before the span
+        if span_start > 0:
+            node_ids.insert(0, input_word_ids[span_start - 1])
+            full_words.insert(0, corpus_words[span_start - 1])
+        # Append input word(s) after the span
+        if span_end < len(corpus_words) - 1:
+            node_ids.append(input_word_ids[span_end + 1])
+            full_words.append(corpus_words[span_end + 1])
+
+        containment_sequences.append({
+            'words': full_words,
+            'node_ids': node_ids,
+            'type': 'substitute',
+            'color': seq_entry['color'],
+        })
 
     containment_data = _json.dumps({
         'hierarchy': containment_hierarchy,
@@ -3170,7 +3255,7 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
         // Build D3 hierarchy and pack layout
         const root = d3.hierarchy(containmentData.hierarchy)
             .sum(d => d.value || 0)
-            .sort((a, b) => (b.value || 0) - (a.value || 0));
+            .sort((a, b) => (a.data.pos || 0) - (b.data.pos || 0));
 
         const pack = d3.pack()
             .size([width - 40, height - 120])
@@ -3277,80 +3362,64 @@ def export_html_tree(phrase: str, tree, subparse_cache: dict, catalog: UnitCatal
                 return t;
             }});
 
-        // Draw sequence links
-        const linkGen = d3.line().curve(d3.curveBasis);
+        // Draw sequence links as straight lines between nodes
+        // Helper: draw a straight line segment with arrowhead at the end
+        function drawSeqLink(x1, y1, x2, y2, color, width, opacity, dashed, nodeRadius) {{
+            // Shorten line to stop at the edge of the target node
+            const dx = x2 - x1, dy = y2 - y1;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            if (dist < nodeRadius * 2) return;  // nodes overlapping, skip
+            const ux = dx / dist, uy = dy / dist;
+            const ex = x2 - ux * nodeRadius, ey = y2 - uy * nodeRadius;
+            const sx = x1 + ux * nodeRadius, sy = y1 + uy * nodeRadius;
 
-        // Input phrase sequence
-        const inputSeq = containmentData.sequences.find(s => s.type === 'input');
-        if (inputSeq) {{
-            const points = inputSeq.node_ids
-                .map(id => nodePositions[id])
-                .filter(p => p);
-            if (points.length > 1) {{
-                g.append('path')
-                    .attr('d', linkGen(points.map(p => [p.x, p.y])))
-                    .attr('fill', 'none')
-                    .attr('stroke', '#1565C0')
-                    .attr('stroke-width', 2.5)
-                    .attr('opacity', 0.6);
-
-                // Arrow indicators between consecutive words
-                for (let i = 0; i < points.length - 1; i++) {{
-                    const mx = (points[i].x + points[i+1].x) / 2;
-                    const my = (points[i].y + points[i+1].y) / 2;
-                    const angle = Math.atan2(points[i+1].y - points[i].y, points[i+1].x - points[i].x);
-                    g.append('polygon')
-                        .attr('points', '-4,-3 4,0 -4,3')
-                        .attr('fill', '#1565C0')
-                        .attr('opacity', 0.5)
-                        .attr('transform', 'translate(' + mx + ',' + my + ') rotate(' + (angle * 180 / Math.PI) + ')');
-                }}
-            }}
+            g.append('line')
+                .attr('x1', sx).attr('y1', sy)
+                .attr('x2', ex).attr('y2', ey)
+                .attr('stroke', color)
+                .attr('stroke-width', width)
+                .attr('opacity', opacity)
+                .attr('stroke-dasharray', dashed ? '4,3' : null);
+            // Arrowhead at end of line (just before target node edge)
+            const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+            g.append('polygon')
+                .attr('points', '-6,-4 0,0 -6,4')
+                .attr('fill', color)
+                .attr('opacity', opacity * 0.8)
+                .attr('transform', 'translate(' + ex + ',' + ey + ') rotate(' + angle + ')');
         }}
 
-        // Substitute sequences — draw from context through substitute node
-        containmentData.sequences.filter(s => s.type === 'substitute').forEach(seq => {{
-            const subPos = nodePositions[seq.node_id];
-            if (!subPos) return;
+        // Debug: log sequences and node positions
+        console.log('Containment sequences:', containmentData.sequences);
+        console.log('Node positions:', Object.keys(nodePositions).length, 'nodes');
+        containmentData.sequences.forEach((seq, i) => {{
+            const missing = seq.node_ids.filter(id => !nodePositions[id]);
+            if (missing.length > 0) console.warn('Seq', i, seq.type, seq.words, 'missing nodes:', missing);
+        }});
 
-            const allWords = (seq.left_ctx || []).concat(seq.words).concat(seq.right_ctx || []);
-            const ctxLen = (seq.left_ctx || []).length;
-            const subLen = seq.words.length;
+        // Draw all sequences
+        containmentData.sequences.forEach(seq => {{
+            const isInput = seq.type === 'input';
+            const color = seq.color;
+            const width = isInput ? 2.5 : 1.5;
+            const opacity = isInput ? 0.6 : 0.5;
+            const dashed = !isInput;
 
-            // Lay out sequence words horizontally centered on the substitute node
-            const wordSpacing = 28;
-            const totalW = (allWords.length - 1) * wordSpacing;
-            const startX = subPos.x - totalW / 2;
-            const seqY = subPos.y + 30;
+            // Resolve node IDs to positions
+            const resolved = seq.node_ids
+                .map(id => ({{ id: id, pos: nodePositions[id] }}))
+                .filter(p => p.pos);
 
-            const seqPoints = allWords.map((w, i) => ({{
-                x: startX + i * wordSpacing,
-                y: seqY,
-                word: w,
-                isCtx: i < ctxLen || i >= ctxLen + subLen,
-            }}));
-
-            // Draw sequence line
-            if (seqPoints.length > 1) {{
-                g.append('path')
-                    .attr('d', linkGen(seqPoints.map(p => [p.x, p.y])))
-                    .attr('fill', 'none')
-                    .attr('stroke', seq.color)
-                    .attr('stroke-width', 1)
-                    .attr('opacity', 0.4)
-                    .attr('stroke-dasharray', '3,2');
+            // Draw a straight line segment between each consecutive pair
+            for (let i = 0; i < resolved.length - 1; i++) {{
+                // Use appropriate node radius for start/end nodes
+                const r = isInput ? 14 : 10;
+                drawSeqLink(
+                    resolved[i].pos.x, resolved[i].pos.y,
+                    resolved[i+1].pos.x, resolved[i+1].pos.y,
+                    color, width, opacity, dashed, r
+                );
             }}
-
-            // Draw word labels along sequence
-            seqPoints.forEach(p => {{
-                g.append('text')
-                    .attr('x', p.x).attr('y', p.y + 4)
-                    .attr('text-anchor', 'middle')
-                    .attr('font-size', '8px')
-                    .attr('fill', p.isCtx ? '#aaa' : seq.color)
-                    .attr('font-weight', p.isCtx ? 'normal' : 'bold')
-                    .text(p.word);
-            }});
         }});
 
         // Tooltips
